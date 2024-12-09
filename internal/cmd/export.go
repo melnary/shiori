@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-shiori/shiori/internal/database"
+	"github.com/go-shiori/shiori/internal/model"
 	"github.com/spf13/cobra"
 )
 
@@ -23,8 +24,10 @@ func exportCmd() *cobra.Command {
 }
 
 func exportHandler(cmd *cobra.Command, args []string) {
+	_, deps := initShiori(cmd.Context(), cmd)
+
 	// Fetch bookmarks from database
-	bookmarks, err := db.GetBookmarks(database.GetBookmarksOptions{})
+	bookmarks, err := deps.Database.GetBookmarks(cmd.Context(), database.GetBookmarksOptions{})
 	if err != nil {
 		cError.Printf("Failed to get bookmarks: %v\n", err)
 		os.Exit(1)
@@ -37,7 +40,9 @@ func exportHandler(cmd *cobra.Command, args []string) {
 
 	// Make sure destination directory exist
 	dstDir := fp.Dir(args[0])
-	os.MkdirAll(dstDir, os.ModePerm)
+	if err := os.MkdirAll(dstDir, model.DataDirPerm); err != nil {
+		cError.Printf("Error crating destination directory: %s", err)
+	}
 
 	// Create destination file
 	dstFile, err := os.Create(args[0])
@@ -57,7 +62,7 @@ func exportHandler(cmd *cobra.Command, args []string) {
 
 	for _, book := range bookmarks {
 		// Create Unix timestamp for bookmark
-		modifiedTime, err := time.Parse("2006-01-02 15:04:05", book.Modified)
+		modifiedTime, err := time.Parse(model.DatabaseDateFormat, book.ModifiedAt)
 		if err != nil {
 			modifiedTime = time.Now()
 		}

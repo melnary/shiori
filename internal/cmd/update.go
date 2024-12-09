@@ -41,6 +41,8 @@ func updateCmd() *cobra.Command {
 }
 
 func updateHandler(cmd *cobra.Command, args []string) {
+	cfg, deps := initShiori(cmd.Context(), cmd)
+
 	// Parse flags
 	url, _ := cmd.Flags().GetString("url")
 	title, _ := cmd.Flags().GetString("title")
@@ -50,7 +52,7 @@ func updateHandler(cmd *cobra.Command, args []string) {
 	skipConfirm, _ := cmd.Flags().GetBool("yes")
 	noArchival, _ := cmd.Flags().GetBool("no-archival")
 	logArchival, _ := cmd.Flags().GetBool("log-archival")
-	keepMetadata := cmd.Flags().Changed("keep-metadata")
+	keep_metadata := cmd.Flags().Changed("keep-metadata")
 
 	// If no arguments (i.e all bookmarks going to be updated), confirm to user
 	if len(args) == 0 && !skipConfirm {
@@ -94,7 +96,7 @@ func updateHandler(cmd *cobra.Command, args []string) {
 		IDs: ids,
 	}
 
-	bookmarks, err := db.GetBookmarks(filterOptions)
+	bookmarks, err := deps.Database.GetBookmarks(cmd.Context(), filterOptions)
 	if err != nil {
 		cError.Printf("Failed to get bookmarks: %v\n", err)
 		os.Exit(1)
@@ -145,7 +147,7 @@ func updateHandler(cmd *cobra.Command, args []string) {
 				book.URL = url
 			}
 
-			go func(i int, book model.Bookmark) {
+			go func(i int, book model.BookmarkDTO) {
 				// Make sure to finish the WG
 				defer wg.Done()
 
@@ -159,26 +161,26 @@ func updateHandler(cmd *cobra.Command, args []string) {
 				content, contentType, err := core.DownloadBookmark(book.URL)
 				if err != nil {
 					chProblem <- book.ID
-					chMessage <- fmt.Errorf("Failed to download %s: %v", book.URL, err)
+					chMessage <- fmt.Errorf("failed to download %s: %v", book.URL, err)
 					return
 				}
 
 				request := core.ProcessRequest{
-					DataDir:     dataDir,
+					DataDir:     cfg.Storage.DataDir,
 					Bookmark:    book,
 					Content:     content,
 					ContentType: contentType,
-					KeepTitle:   keepMetadata,
-					KeepExcerpt: keepMetadata,
+					KeepTitle:   keep_metadata,
+					KeepExcerpt: keep_metadata,
 					LogArchival: logArchival,
 				}
 
-				book, _, err = core.ProcessBookmark(request)
+				book, _, err = core.ProcessBookmark(deps, request)
 				content.Close()
 
 				if err != nil {
 					chProblem <- book.ID
-					chMessage <- fmt.Errorf("Failed to process %s: %v", book.URL, err)
+					chMessage <- fmt.Errorf("failed to process %s: %v", book.URL, err)
 					return
 				}
 
@@ -285,7 +287,7 @@ func updateHandler(cmd *cobra.Command, args []string) {
 	}
 
 	// Save bookmarks to database
-	bookmarks, err = db.SaveBookmarks(bookmarks...)
+	bookmarks, err = deps.Database.SaveBookmarks(cmd.Context(), false, bookmarks...)
 	if err != nil {
 		cError.Printf("Failed to save bookmark: %v\n", err)
 		os.Exit(1)

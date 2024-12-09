@@ -29,6 +29,8 @@ func addCmd() *cobra.Command {
 }
 
 func addHandler(cmd *cobra.Command, args []string) {
+	cfg, deps := initShiori(cmd.Context(), cmd)
+
 	// Read flag and arguments
 	url := args[0]
 	title, _ := cmd.Flags().GetString("title")
@@ -43,7 +45,7 @@ func addHandler(cmd *cobra.Command, args []string) {
 	excerpt = normalizeSpace(excerpt)
 
 	// Create bookmark item
-	book := model.Bookmark{
+	book := model.BookmarkDTO{
 		URL:           url,
 		Title:         title,
 		Excerpt:       excerpt,
@@ -56,20 +58,27 @@ func addHandler(cmd *cobra.Command, args []string) {
 		book.Tags[i].Name = strings.TrimSpace(tag)
 	}
 
-	// Create bookmark ID
-	var err error
-	book.ID, err = db.CreateNewID("bookmark")
-	if err != nil {
-		cError.Printf("Failed to create ID: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Clean up bookmark URL
+	var err error
 	book.URL, err = core.RemoveUTMParams(book.URL)
 	if err != nil {
 		cError.Printf("Failed to clean URL: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Make sure bookmark's title not empty
+	if book.Title == "" {
+		book.Title = book.URL
+	}
+
+	// Save bookmark to database
+	books, err := deps.Database.SaveBookmarks(cmd.Context(), true, book)
+	if err != nil {
+		cError.Printf("Failed to save bookmark: %v\n", err)
+		os.Exit(1)
+	}
+
+	book = books[0]
 
 	// If it's not offline mode, fetch data from internet.
 	if !offline {
@@ -83,7 +92,7 @@ func addHandler(cmd *cobra.Command, args []string) {
 
 		if err == nil && content != nil {
 			request := core.ProcessRequest{
-				DataDir:     dataDir,
+				DataDir:     cfg.Storage.DataDir,
 				Bookmark:    book,
 				Content:     content,
 				ContentType: contentType,
@@ -92,7 +101,7 @@ func addHandler(cmd *cobra.Command, args []string) {
 				KeepExcerpt: excerpt != "",
 			}
 
-			book, isFatalErr, err = core.ProcessBookmark(request)
+			book, isFatalErr, err = core.ProcessBookmark(deps, request)
 			content.Close()
 
 			if err != nil {
@@ -103,18 +112,13 @@ func addHandler(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 		}
-	}
 
-	// Make sure bookmark's title not empty
-	if book.Title == "" {
-		book.Title = book.URL
-	}
-
-	// Save bookmark to database
-	_, err = db.SaveBookmarks(book)
-	if err != nil {
-		cError.Printf("Failed to save bookmark: %v\n", err)
-		os.Exit(1)
+		// Save bookmark to database
+		_, err = deps.Database.SaveBookmarks(cmd.Context(), false, book)
+		if err != nil {
+			cError.Printf("Failed to save bookmark with content: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Print added bookmark

@@ -6,6 +6,7 @@ import (
 	nurl "net/url"
 	"os"
 	"os/exec"
+	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -13,23 +14,21 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/go-shiori/shiori/internal/model"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var (
-	cIndex    = color.New(color.FgHiCyan)
-	cSymbol   = color.New(color.FgHiMagenta)
-	cTitle    = color.New(color.FgHiGreen).Add(color.Bold)
-	cReadTime = color.New(color.FgHiMagenta)
-	cURL      = color.New(color.FgHiYellow)
-	cExcerpt  = color.New(color.FgHiWhite)
-	cTag      = color.New(color.FgHiBlue)
+	cIndex   = color.New(color.FgHiCyan)
+	cSymbol  = color.New(color.FgHiMagenta)
+	cTitle   = color.New(color.FgHiGreen).Add(color.Bold)
+	cURL     = color.New(color.FgHiYellow)
+	cExcerpt = color.New(color.FgHiWhite)
+	cTag     = color.New(color.FgHiBlue)
 
-	cInfo    = color.New(color.FgHiCyan)
-	cError   = color.New(color.FgHiRed)
-	cWarning = color.New(color.FgHiYellow)
+	cInfo  = color.New(color.FgHiCyan)
+	cError = color.New(color.FgHiRed)
 
-	errInvalidIndex = errors.New("Index is not valid")
+	errInvalidIndex = errors.New("index is not valid")
 )
 
 func normalizeSpace(str string) string {
@@ -42,7 +41,7 @@ func isURLValid(s string) bool {
 	return err == nil && tmp.Scheme != "" && tmp.Hostname() != ""
 }
 
-func printBookmarks(bookmarks ...model.Bookmark) {
+func printBookmarks(bookmarks ...model.BookmarkDTO) {
 	for _, bookmark := range bookmarks {
 		// Create bookmark index
 		strBookmarkIndex := fmt.Sprintf("%d. ", bookmark.ID)
@@ -130,7 +129,7 @@ func openBrowser(url string) error {
 }
 
 func getTerminalWidth() int {
-	width, _, _ := terminal.GetSize(int(os.Stdin.Fd()))
+	width, _, _ := term.GetSize(int(os.Stdin.Fd()))
 	return width
 }
 
@@ -165,4 +164,8 @@ func validateTitle(title, fallback string) string {
 	}
 
 	return validUtf
+}
+
+func SFCallerPrettyfier(frame *runtime.Frame) (string, string) {
+	return "", fmt.Sprintf("%s:%d", path.Base(frame.File), frame.Line)
 }

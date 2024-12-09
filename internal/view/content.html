@@ -8,73 +8,81 @@
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-	<link rel="apple-touch-icon-precomposed" sizes="152x152" href="res/apple-touch-icon-152x152.png">
-	<link rel="apple-touch-icon-precomposed" sizes="144x144" href="res/apple-touch-icon-144x144.png">
-	<link rel="icon" type="image/png" href="res/favicon-32x32.png" sizes="32x32">
-	<link rel="icon" type="image/png" href="res/favicon-16x16.png" sizes="16x16">
-	<link rel="icon" type="image/x-icon" href="res/favicon.ico">
+	<link rel="apple-touch-icon-precomposed" sizes="152x152" href="assets/res/apple-touch-icon-152x152.png">
+	<link rel="apple-touch-icon-precomposed" sizes="144x144" href="assets/res/apple-touch-icon-144x144.png">
+	<link rel="icon" type="image/png" href="assets/res/favicon-32x32.png" sizes="32x32">
+	<link rel="icon" type="image/png" href="assets/res/favicon-16x16.png" sizes="16x16">
+	<link rel="icon" type="image/x-icon" href="assets/res/favicon.ico">
 
-	<link href="css/source-sans-pro.min.css" rel="stylesheet">
-	<link href="css/stylesheet.css" rel="stylesheet">
-	<link href="css/custom-dialog.css" rel="stylesheet">
-	<link href="css/bookmark-item.css" rel="stylesheet">
+	<link href="assets/css/style.css" rel="stylesheet">
 
-	<link rel="manifest" href="manifest.json">
+	<link rel="manifest" href="assets/res/manifest.json">
 
-	<script src="js/dayjs.min.js"></script>
-	<script src="js/vue.min.js"></script>
+	<script src="assets/js/vue.min.js"></script>
 </head>
 
-<body class="night">
-	<div id="content-scene" :class="{night: appOptions.nightMode}">
+<body>
+	<div id="content-scene">
 		<div id="header">
-			<p id="metadata" v-cloak>Added {{localtime()}}</p>
-			<p id="title">$$.Book.Title$$</p>
-			<div id="links">
-				<a href="$$.Book.URL$$" target="_blank" rel="noopener">View Original</a>
+			<p id="title" dir="auto">$$.Book.Title$$</p>
+			<div class="links">
+				<a href="$$.Book.URL$$" target="_blank" rel="noopener noreferrer">View Original</a>
 				$$if .Book.HasArchive$$
 				<a href="bookmark/$$.Book.ID$$/archive">View Archive</a>
 				$$end$$
+				$$if .Book.HasEbook$$
+				<a href="bookmark/$$.Book.ID$$/ebook" download="$$.Book.Title$$.epub">Download Ebook</a>
+				$$end$$
 			</div>
 		</div>
-		<div id="content" v-pre>
-			$$html .Book.HTML$$
+		<div id="content" dir="auto" v-pre>
+			$$.HTML$$
 		</div>
+        <footer class="content-footer">
+            <p class="metadata">{{ createdModifiedTime() }} </p>
+        </footer>
 	</div>
 
 	<script type="module">
 		// Create initial variable
-		import basePage from "./js/page/base.js";
+		import basePage from "./assets/js/page/base.js";
 
 		new Vue({
 			el: '#content-scene',
 			mixins: [basePage],
 			data: {
-				modified: "$$.Book.Modified$$"
+				created: "$$.Book.CreatedAt$$"
 			},
 			methods: {
-				localtime() {
-					var strTime = this.modified.replace(" ", "T");
-					if (!strTime.endsWith("Z")) {
-						strTime += "Z";
-					}
-					return dayjs(strTime).format("D MMMM YYYY, HH:mm:ss");
+				createdModifiedTime() {
+          const strCreatedTime = "$$.Book.CreatedAt$$".replace(" ", "T") + ("$$.Book.CreatedAt$$".endsWith("Z") ? "" : "Z");
+          const strModifiedTime = "$$.Book.ModifiedAt$$".replace(" ", "T") + ("$$.Book.ModifiedAt$$".endsWith("Z") ? "" : "Z");
+
+          const createdDate = new Date(strCreatedTime);
+          const modifiedDate = new Date(strModifiedTime);
+
+          if (createdDate.toDateString() === modifiedDate.toDateString()) {
+            return `Added ${createdDate.getDate()} ${createdDate.toLocaleString('default', { month: 'long' })} ${createdDate.getFullYear()}`;
+          } else {
+            return `Added ${createdDate.getDate()} ${createdDate.toLocaleString('default', { month: 'long' })}  ${createdDate.getFullYear()}  | Last Modified ${modifiedDate.getDate()} ${modifiedDate.toLocaleString('default', {month: 'long'})} ${modifiedDate.getFullYear()}`;
+        }
 				},
 				loadSetting() {
-					var opts = JSON.parse(localStorage.getItem("shiori-setting")) || {},
-						showId = (typeof opts.showId === "boolean") ? opts.showId : false,
-						listMode = (typeof opts.listMode === "boolean") ? opts.listMode : false,
-						nightMode = (typeof opts.nightMode === "boolean") ? opts.nightMode : false,
-						useArchive = (typeof opts.useArchive === "boolean") ? opts.useArchive : false;
+					var opts = JSON.parse(localStorage.getItem("shiori-account")) || {},
+						ShowId = (typeof opts.config.ShowId === "boolean") ? opts.config.ShowId : false,
+						ListMode = (typeof opts.config.ListMode === "boolean") ? opts.config.ListMode : false,
+						Theme = (typeof opts.config.Theme === "string" && opts.config.Theme !== "") ? opts.config.Theme : "follow",
+						UseArchive = (typeof opts.config.UseArchive === "boolean") ? opts.config.UseArchive : false,
+						CreateEbook = (typeof opts.config.CreateEbook === "boolean") ? opts.config.CreateEbook : false;
 
 					this.appOptions = {
-						showId: showId,
-						listMode: listMode,
-						nightMode: nightMode,
-						useArchive: useArchive,
+						ShowId: ShowId,
+						ListMode: ListMode,
+						Theme: Theme,
+						UseArchive: UseArchive,
+						CreateEbook: CreateEbook,
 					};
-
-					document.body.className = nightMode ? "night" : "";
+                    this.themeSwitch(Theme)
 				}
 			},
 			mounted() {
@@ -82,7 +90,7 @@
 
 				document.querySelectorAll("#content a").forEach(elem => {
 					elem.setAttribute("target", "_blank");
-					elem.setAttribute("rel", "noopener");
+					elem.setAttribute("rel", "noopener noreferrer");
 				});
 			}
 		});
@@ -90,7 +98,7 @@
 	<script type="module">
 		if ('serviceWorker' in navigator) {
 			window.addEventListener('load', function() {
-				navigator.serviceWorker.register('pwabuilder-sw.js');
+				navigator.serviceWorker.register('assets/js/pwabuilder-sw.js');
 			});
 		}
 	</script>
@@ -98,6 +106,7 @@
 		import 'https://cdn.jsdelivr.net/npm/@pwabuilder/pwaupdate';
 
 		const el = document.createElement('pwa-update');
+		el.setAttribute('swpath', 'assets/js/pwabuilder-sw.js');
 		document.body.appendChild(el);
 	</script>
 </body>

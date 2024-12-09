@@ -25,12 +25,7 @@ func pocketCmd() *cobra.Command {
 }
 
 func pocketHandler(cmd *cobra.Command, args []string) {
-	// Prepare bookmark's ID
-	bookID, err := db.CreateNewID("bookmark")
-	if err != nil {
-		cError.Printf("Failed to create ID: %v\n", err)
-		return
-	}
+	_, deps := initShiori(cmd.Context(), cmd)
 
 	// Open pocket's file
 	srcFile, err := os.Open(args[0])
@@ -41,7 +36,7 @@ func pocketHandler(cmd *cobra.Command, args []string) {
 	defer srcFile.Close()
 
 	// Parse pocket's file
-	bookmarks := []model.Bookmark{}
+	bookmarks := []model.BookmarkDTO{}
 	mapURL := make(map[string]struct{})
 
 	doc, err := goquery.NewDocumentFromReader(srcFile)
@@ -77,7 +72,13 @@ func pocketHandler(cmd *cobra.Command, args []string) {
 			return
 		}
 
-		if _, exist := db.GetBookmark(0, url); exist {
+		_, exist, err := deps.Database.GetBookmark(cmd.Context(), 0, url)
+		if err != nil {
+			cError.Printf("Skip %s: Get Bookmark fail, %v", url, err)
+			return
+		}
+
+		if exist {
 			cError.Printf("Skip %s: URL already exists\n", url)
 			mapURL[url] = struct{}{}
 			return
@@ -92,21 +93,19 @@ func pocketHandler(cmd *cobra.Command, args []string) {
 		}
 
 		// Add item to list
-		bookmark := model.Bookmark{
-			ID:       bookID,
-			URL:      url,
-			Title:    title,
-			Modified: modified.Format("2006-01-02 15:04:05"),
-			Tags:     tags,
+		bookmark := model.BookmarkDTO{
+			URL:        url,
+			Title:      title,
+			ModifiedAt: modified.Format(model.DatabaseDateFormat),
+			Tags:       tags,
 		}
 
-		bookID++
 		mapURL[url] = struct{}{}
 		bookmarks = append(bookmarks, bookmark)
 	})
 
 	// Save bookmark to database
-	bookmarks, err = db.SaveBookmarks(bookmarks...)
+	bookmarks, err = deps.Database.SaveBookmarks(cmd.Context(), true, bookmarks...)
 	if err != nil {
 		cError.Printf("Failed to save bookmarks: %v\n", err)
 		os.Exit(1)

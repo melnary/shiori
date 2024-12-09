@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -8,205 +9,261 @@ import (
 
 	"github.com/go-shiori/shiori/internal/model"
 	"github.com/jmoiron/sqlx"
+	"github.com/pkg/errors"
 	"golang.org/x/crypto/bcrypt"
+
+	_ "github.com/lib/pq"
 )
+
+var postgresMigrations = []migration{
+	newFileMigration("0.0.0", "0.1.0", "postgres/0000_system"),
+	newFileMigration("0.1.0", "0.2.0", "postgres/0001_initial"),
+	newFuncMigration("0.2.0", "0.3.0", func(db *sql.DB) error {
+		// Ensure that bookmark table has `has_content` column and account table has `config` column
+		// for users upgrading from <1.5.4 directly into this version.
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to start transaction: %w", err)
+		}
+		defer tx.Rollback()
+
+		_, err = tx.Exec(`ALTER TABLE bookmark ADD COLUMN has_content BOOLEAN DEFAULT FALSE NOT NULL`)
+		if err != nil && strings.Contains(err.Error(), `column "has_content" of relation "bookmark" already exists`) {
+			tx.Rollback()
+		} else if err != nil {
+			return fmt.Errorf("failed to add has_content column to bookmark table: %w", err)
+		} else if err == nil {
+			if errCommit := tx.Commit(); errCommit != nil {
+				return fmt.Errorf("failed to commit transaction: %w", errCommit)
+			}
+		}
+
+		tx, err = db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to start transaction: %w", err)
+		}
+		defer tx.Rollback()
+
+		_, err = tx.Exec(`ALTER TABLE account ADD COLUMN config JSONB NOT NULL DEFAULT '{}'`)
+		if err != nil && strings.Contains(err.Error(), `column "config" of relation "account" already exists`) {
+			tx.Rollback()
+		} else if err != nil {
+			return fmt.Errorf("failed to add config column to account table: %w", err)
+		} else if err == nil {
+			if errCommit := tx.Commit(); errCommit != nil {
+				return fmt.Errorf("failed to commit transaction: %w", errCommit)
+			}
+		}
+
+		return nil
+	}),
+	newFileMigration("0.3.0", "0.4.0", "postgres/0002_created_time"),
+}
 
 // PGDatabase is implementation of Database interface
 // for connecting to PostgreSQL database.
 type PGDatabase struct {
-	sqlx.DB
+	dbbase
 }
 
 // OpenPGDatabase creates and opens connection to a PostgreSQL Database.
-func OpenPGDatabase(connString string) (pgDB *PGDatabase, err error) {
+func OpenPGDatabase(ctx context.Context, connString string) (pgDB *PGDatabase, err error) {
 	// Open database and start transaction
-	db := sqlx.MustConnect("postgres", connString)
-	db.SetMaxOpenConns(100)
-
-	tx, err := db.Beginx()
+	db, err := sqlx.ConnectContext(ctx, "postgres", connString)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
-	// Make sure to rollback if panic ever happened
-	defer func() {
-		if r := recover(); r != nil {
-			panicErr, _ := r.(error)
-			tx.Rollback()
+	db.SetMaxOpenConns(100)
+	db.SetConnMaxLifetime(time.Second)
 
-			pgDB = nil
-			err = panicErr
-		}
-	}()
-
-	// Create tables
-	tx.MustExec(`CREATE TABLE IF NOT EXISTS account(
-		id       SERIAL,
-		username VARCHAR(250) NOT NULL,
-		password BYTEA    NOT NULL,
-		owner    BOOLEAN  NOT NULL DEFAULT FALSE,
-		PRIMARY KEY (id),
-		CONSTRAINT account_username_UNIQUE UNIQUE (username))`)
-
-	tx.MustExec(`CREATE TABLE IF NOT EXISTS bookmark(
-		id       SERIAL,
-		url      TEXT       NOT NULL,
-		title    TEXT       NOT NULL,
-		excerpt  TEXT       NOT NULL DEFAULT '',
-		author   TEXT       NOT NULL DEFAULT '',
-		public   SMALLINT   NOT NULL DEFAULT 0,
-		content  TEXT       NOT NULL DEFAULT '',
-		html     TEXT       NOT NULL DEFAULT '',
-		modified TIMESTAMP(0) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		PRIMARY KEY(id),
-		CONSTRAINT bookmark_url_UNIQUE UNIQUE (url))`)
-
-	tx.MustExec(`CREATE TABLE IF NOT EXISTS tag(
-		id   SERIAL,
-		name VARCHAR(250) NOT NULL,
-		PRIMARY KEY (id),
-		CONSTRAINT tag_name_UNIQUE UNIQUE (name))`)
-
-	tx.MustExec(`CREATE TABLE IF NOT EXISTS bookmark_tag(
-		bookmark_id INT      NOT NULL,
-		tag_id      INT      NOT NULL,
-		PRIMARY KEY(bookmark_id, tag_id),
-		CONSTRAINT bookmark_tag_bookmark_id_FK FOREIGN KEY (bookmark_id) REFERENCES bookmark (id),
-		CONSTRAINT bookmark_tag_tag_id_FK FOREIGN KEY (tag_id) REFERENCES tag (id))`)
-
-	// Create indices
-	tx.MustExec(`CREATE INDEX IF NOT EXISTS bookmark_tag_bookmark_id_FK ON bookmark_tag (bookmark_id)`)
-	tx.MustExec(`CREATE INDEX IF NOT EXISTS bookmark_tag_tag_id_FK ON bookmark_tag (tag_id)`)
-
-	err = tx.Commit()
-	checkError(err)
-
-	pgDB = &PGDatabase{*db}
+	pgDB = &PGDatabase{dbbase: dbbase{db}}
 	return pgDB, err
+}
+
+// DBX returns the underlying sqlx.DB object
+func (db *PGDatabase) DBx() *sqlx.DB {
+	return db.DB
+}
+
+// Migrate runs migrations for this database engine
+func (db *PGDatabase) Migrate(ctx context.Context) error {
+	if err := runMigrations(ctx, db, postgresMigrations); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
+}
+
+// GetDatabaseSchemaVersion fetches the current migrations version of the database
+func (db *PGDatabase) GetDatabaseSchemaVersion(ctx context.Context) (string, error) {
+	var version string
+
+	err := db.GetContext(ctx, &version, "SELECT database_schema_version FROM shiori_system")
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+
+	return version, nil
+}
+
+// SetDatabaseSchemaVersion sets the current migrations version of the database
+func (db *PGDatabase) SetDatabaseSchemaVersion(ctx context.Context, version string) error {
+	tx := db.MustBegin()
+	defer tx.Rollback()
+
+	return db.withTx(ctx, func(tx *sqlx.Tx) error {
+		_, err := tx.Exec("UPDATE shiori_system SET database_schema_version = $1", version)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		return tx.Commit()
+	})
 }
 
 // SaveBookmarks saves new or updated bookmarks to database.
 // Returns the saved ID and error message if any happened.
-func (db *PGDatabase) SaveBookmarks(bookmarks ...model.Bookmark) (result []model.Bookmark, err error) {
-	// Prepare transaction
-	tx, err := db.Beginx()
-	if err != nil {
-		return []model.Bookmark{}, err
-	}
-
-	// Make sure to rollback if panic ever happened
-	defer func() {
-		if r := recover(); r != nil {
-			panicErr, _ := r.(error)
-			tx.Rollback()
-
-			result = []model.Bookmark{}
-			err = panicErr
-		}
-	}()
-
-	// Prepare statement
-	stmtInsertBook, err := tx.Preparex(`INSERT INTO bookmark
-		(url, title, excerpt, author, public, content, html, modified)
-		VALUES($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT(url) DO UPDATE SET
-		url      = $1,
-		title    = $2,
-		excerpt  = $3,
-		author   = $4,
-		public   = $5,
-		content  = $6,
-		html     = $7,
-		modified = $8`)
-	checkError(err)
-
-	stmtGetTag, err := tx.Preparex(`SELECT id FROM tag WHERE name = $1`)
-	checkError(err)
-
-	stmtInsertTag, err := tx.Preparex(`INSERT INTO tag (name) VALUES ($1) RETURNING id`)
-	checkError(err)
-
-	stmtInsertBookTag, err := tx.Preparex(`INSERT INTO bookmark_tag
-		(tag_id, bookmark_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`)
-	checkError(err)
-
-	stmtDeleteBookTag, err := tx.Preparex(`DELETE FROM bookmark_tag
-		WHERE bookmark_id = $1 AND tag_id = $2`)
-	checkError(err)
-
-	// Prepare modified time
-	modifiedTime := time.Now().UTC().Format("2006-01-02 15:04:05")
-
-	// Execute statements
-	result = []model.Bookmark{}
-	for _, book := range bookmarks {
-		// Check ID, URL and title
-		if book.ID == 0 {
-			panic(fmt.Errorf("ID must not be empty"))
+func (db *PGDatabase) SaveBookmarks(ctx context.Context, create bool, bookmarks ...model.BookmarkDTO) (result []model.BookmarkDTO, err error) {
+	result = []model.BookmarkDTO{}
+	if err := db.withTx(ctx, func(tx *sqlx.Tx) error {
+		// Prepare statement
+		stmtInsertBook, err := tx.Preparex(`INSERT INTO bookmark
+			(url, title, excerpt, author, public, content, html, modified_at, created_at)
+			VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id`)
+		if err != nil {
+			return errors.WithStack(err)
 		}
 
-		if book.URL == "" {
-			panic(fmt.Errorf("URL must not be empty"))
+		stmtUpdateBook, err := tx.Preparex(`UPDATE bookmark SET
+			url      = $1,
+			title    = $2,
+			excerpt  = $3,
+			author   = $4,
+			public   = $5,
+			content  = $6,
+			html     = $7,
+			modified_at = $8
+			WHERE id = $9`)
+		if err != nil {
+			return errors.WithStack(err)
 		}
 
-		if book.Title == "" {
-			panic(fmt.Errorf("title must not be empty"))
+		stmtGetTag, err := tx.Preparex(`SELECT id FROM tag WHERE name = $1`)
+		if err != nil {
+			return errors.WithStack(err)
 		}
 
-		// Set modified time
-		book.Modified = modifiedTime
+		stmtInsertTag, err := tx.Preparex(`INSERT INTO tag (name) VALUES ($1) RETURNING id`)
+		if err != nil {
+			return errors.WithStack(err)
+		}
 
-		// Save bookmark
-		stmtInsertBook.MustExec(
-			book.URL, book.Title, book.Excerpt, book.Author,
-			book.Public, book.Content, book.HTML, book.Modified)
+		stmtInsertBookTag, err := tx.Preparex(`INSERT INTO bookmark_tag
+			(tag_id, bookmark_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`)
+		if err != nil {
+			return errors.WithStack(err)
+		}
 
-		// Save book tags
-		newTags := []model.Tag{}
-		for _, tag := range book.Tags {
-			// If it's deleted tag, delete and continue
-			if tag.Deleted {
-				stmtDeleteBookTag.MustExec(book.ID, tag.ID)
-				continue
+		stmtDeleteBookTag, err := tx.Preparex(`DELETE FROM bookmark_tag
+			WHERE bookmark_id = $1 AND tag_id = $2`)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		// Prepare modified time
+		modifiedTime := time.Now().UTC().Format(model.DatabaseDateFormat)
+
+		// Execute statements
+		result = []model.BookmarkDTO{}
+		for _, book := range bookmarks {
+			// URL and title
+			if book.URL == "" {
+				return errors.New("URL must not be empty")
 			}
 
-			// Normalize tag name
-			tagName := strings.ToLower(tag.Name)
-			tagName = strings.Join(strings.Fields(tagName), " ")
+			if book.Title == "" {
+				return errors.New("title must not be empty")
+			}
 
-			// If tag doesn't have any ID, fetch it from database
-			if tag.ID == 0 {
-				err = stmtGetTag.Get(&tag.ID, tagName)
-				checkError(err)
+			// Set modified time
+			if book.ModifiedAt == "" {
+				book.ModifiedAt = modifiedTime
+			}
 
-				// If tag doesn't exist in database, save it
-				if tag.ID == 0 {
-					var tagID64 int64
-					err = stmtInsertTag.Get(&tagID64, tagName)
-					checkError(err)
+			// Save bookmark
+			var err error
+			if create {
+				book.CreatedAt = modifiedTime
+				err = stmtInsertBook.QueryRowContext(ctx,
+					book.URL, book.Title, book.Excerpt, book.Author,
+					book.Public, book.Content, book.HTML, book.ModifiedAt, book.CreatedAt).Scan(&book.ID)
+			} else {
+				_, err = stmtUpdateBook.ExecContext(ctx,
+					book.URL, book.Title, book.Excerpt, book.Author,
+					book.Public, book.Content, book.HTML, book.ModifiedAt, book.ID)
+			}
+			if err != nil {
+				return errors.WithStack(err)
+			}
 
-					tag.ID = int(tagID64)
+			// Save book tags
+			newTags := []model.Tag{}
+			for _, tag := range book.Tags {
+				// If it's deleted tag, delete and continue
+				if tag.Deleted {
+					_, err = stmtDeleteBookTag.ExecContext(ctx, book.ID, tag.ID)
+					if err != nil {
+						return errors.WithStack(err)
+					}
+					continue
 				}
 
-				stmtInsertBookTag.Exec(tag.ID, book.ID)
+				// Normalize tag name
+				tagName := strings.ToLower(tag.Name)
+				tagName = strings.Join(strings.Fields(tagName), " ")
+
+				// If tag doesn't have any ID, fetch it from database
+				if tag.ID == 0 {
+					err = stmtGetTag.GetContext(ctx, &tag.ID, tagName)
+					if err != nil && !errors.Is(err, sql.ErrNoRows) {
+						return errors.WithStack(err)
+					}
+
+					// If tag doesn't exist in database, save it
+					if tag.ID == 0 {
+						var tagID64 int64
+						err = stmtInsertTag.GetContext(ctx, &tagID64, tagName)
+						if err != nil {
+							return errors.WithStack(err)
+						}
+
+						tag.ID = int(tagID64)
+					}
+
+					if _, err := stmtInsertBookTag.ExecContext(ctx, tag.ID, book.ID); err != nil {
+						return errors.WithStack(err)
+					}
+				}
+
+				newTags = append(newTags, tag)
 			}
 
-			newTags = append(newTags, tag)
+			book.Tags = newTags
+			result = append(result, book)
 		}
 
-		book.Tags = newTags
-		result = append(result, book)
+		return nil
+	}); err != nil {
+		return nil, errors.WithStack(err)
 	}
 
-	// Commit transaction
-	err = tx.Commit()
-	checkError(err)
-
-	return result, err
+	return result, nil
 }
 
 // GetBookmarks fetch list of bookmarks based on submitted options.
-func (db *PGDatabase) GetBookmarks(opts GetBookmarksOptions) ([]model.Bookmark, error) {
+func (db *PGDatabase) GetBookmarks(ctx context.Context, opts GetBookmarksOptions) ([]model.BookmarkDTO, error) {
 	// Create initial query
 	columns := []string{
 		`id`,
@@ -215,7 +272,8 @@ func (db *PGDatabase) GetBookmarks(opts GetBookmarksOptions) ([]model.Bookmark, 
 		`excerpt`,
 		`author`,
 		`public`,
-		`modified`,
+		`created_at`,
+		`modified_at`,
 		`content <> '' has_content`}
 
 	if opts.WithContent {
@@ -237,11 +295,12 @@ func (db *PGDatabase) GetBookmarks(opts GetBookmarksOptions) ([]model.Bookmark, 
 	// Add where clause for search keyword
 	if opts.Keyword != "" {
 		query += ` AND (
-			url LIKE :lkw OR 
-			MATCH(title, excerpt, content) AGAINST (:kw IN BOOLEAN MODE)
+			url LIKE '%' || :kw || '%' OR
+			title LIKE '%' || :kw || '%' OR
+			excerpt LIKE '%' || :kw || '%' OR
+			content LIKE '%' || :kw || '%'
 		)`
 
-		arg["lkw"] = "%" + opts.Keyword + "%"
 		arg["kw"] = opts.Keyword
 	}
 
@@ -303,7 +362,7 @@ func (db *PGDatabase) GetBookmarks(opts GetBookmarksOptions) ([]model.Bookmark, 
 	case ByLastAdded:
 		query += ` ORDER BY id DESC`
 	case ByLastModified:
-		query += ` ORDER BY modified DESC`
+		query += ` ORDER BY modified_at DESC`
 	default:
 		query += ` ORDER BY id`
 	}
@@ -315,7 +374,8 @@ func (db *PGDatabase) GetBookmarks(opts GetBookmarksOptions) ([]model.Bookmark, 
 	}
 
 	// Expand query, because some of the args might be an array
-	query, args, err := sqlx.Named(query, arg)
+	var err error
+	query, args, _ := sqlx.Named(query, arg)
 	query, args, err = sqlx.In(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to expand query: %v", err)
@@ -323,17 +383,17 @@ func (db *PGDatabase) GetBookmarks(opts GetBookmarksOptions) ([]model.Bookmark, 
 	query = db.Rebind(query)
 
 	// Fetch bookmarks
-	bookmarks := []model.Bookmark{}
-	err = db.Select(&bookmarks, query, args...)
+	bookmarks := []model.BookmarkDTO{}
+	err = db.SelectContext(ctx, &bookmarks, query, args...)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to fetch data: %v", err)
 	}
 
 	// Fetch tags for each bookmarks
-	stmtGetTags, err := db.Preparex(`SELECT t.id, t.name 
-		FROM bookmark_tag bt 
+	stmtGetTags, err := db.PreparexContext(ctx, `SELECT t.id, t.name
+		FROM bookmark_tag bt
 		LEFT JOIN tag t ON bt.tag_id = t.id
-		WHERE bt.bookmark_id = $1 
+		WHERE bt.bookmark_id = $1
 		ORDER BY t.name`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare tag query: %v", err)
@@ -342,7 +402,7 @@ func (db *PGDatabase) GetBookmarks(opts GetBookmarksOptions) ([]model.Bookmark, 
 
 	for i, book := range bookmarks {
 		book.Tags = []model.Tag{}
-		err = stmtGetTags.Select(&book.Tags, book.ID)
+		err = stmtGetTags.SelectContext(ctx, &book.Tags, book.ID)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, fmt.Errorf("failed to fetch tags: %v", err)
 		}
@@ -354,7 +414,7 @@ func (db *PGDatabase) GetBookmarks(opts GetBookmarksOptions) ([]model.Bookmark, 
 }
 
 // GetBookmarksCount fetch count of bookmarks based on submitted options.
-func (db *PGDatabase) GetBookmarksCount(opts GetBookmarksOptions) (int, error) {
+func (db *PGDatabase) GetBookmarksCount(ctx context.Context, opts GetBookmarksOptions) (int, error) {
 	// Create initial query
 	query := `SELECT COUNT(id) FROM bookmark WHERE TRUE`
 
@@ -369,8 +429,10 @@ func (db *PGDatabase) GetBookmarksCount(opts GetBookmarksOptions) (int, error) {
 	// Add where clause for search keyword
 	if opts.Keyword != "" {
 		query += ` AND (
-			url LIKE :lurl OR 
-			MATCH(title, excerpt, content) AGAINST (:kw IN BOOLEAN MODE)
+			url LIKE '%' || :kw || '%' OR
+			title LIKE '%' || :kw || '%' OR
+			excerpt LIKE '%' || :kw || '%' OR
+			content LIKE '%' || :kw || '%'
 		)`
 
 		arg["lurl"] = "%" + opts.Keyword + "%"
@@ -431,76 +493,87 @@ func (db *PGDatabase) GetBookmarksCount(opts GetBookmarksOptions) (int, error) {
 	}
 
 	// Expand query, because some of the args might be an array
+	var err error
 	query, args, err := sqlx.Named(query, arg)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+
 	query, args, err = sqlx.In(query, args...)
 	if err != nil {
-		return 0, fmt.Errorf("failed to expand query: %v", err)
+		return 0, errors.WithStack(err)
 	}
 	query = db.Rebind(query)
 
 	// Fetch count
 	var nBookmarks int
-	err = db.Get(&nBookmarks, query, args...)
+	err = db.GetContext(ctx, &nBookmarks, query, args...)
 	if err != nil && err != sql.ErrNoRows {
-		return 0, fmt.Errorf("failed to fetch count: %v", err)
+		return 0, errors.WithStack(err)
 	}
 
 	return nBookmarks, nil
 }
 
 // DeleteBookmarks removes all record with matching ids from database.
-func (db *PGDatabase) DeleteBookmarks(ids ...int) (err error) {
-	// Begin transaction
-	tx, err := db.Beginx()
-	if err != nil {
-		return err
+func (db *PGDatabase) DeleteBookmarks(ctx context.Context, ids ...int) (err error) {
+	if err := db.withTx(ctx, func(tx *sqlx.Tx) error {
+		// Prepare queries
+		delBookmark := `DELETE FROM bookmark`
+		delBookmarkTag := `DELETE FROM bookmark_tag`
+
+		// Delete bookmark(s)
+		if len(ids) == 0 {
+			_, err := tx.ExecContext(ctx, delBookmarkTag)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+
+			_, err = tx.ExecContext(ctx, delBookmark)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+		} else {
+			delBookmark += ` WHERE id = $1`
+			delBookmarkTag += ` WHERE bookmark_id = $1`
+
+			stmtDelBookmark, err := tx.Preparex(delBookmark)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			stmtDelBookmarkTag, err := tx.Preparex(delBookmarkTag)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+
+			for _, id := range ids {
+				_, err = stmtDelBookmarkTag.ExecContext(ctx, id)
+				if err != nil {
+					return errors.WithStack(err)
+				}
+
+				_, err = stmtDelBookmark.ExecContext(ctx, id)
+				if err != nil {
+					return errors.WithStack(err)
+				}
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return errors.WithStack(err)
 	}
 
-	// Make sure to rollback if panic ever happened
-	defer func() {
-		if r := recover(); r != nil {
-			panicErr, _ := r.(error)
-			tx.Rollback()
-
-			err = panicErr
-		}
-	}()
-
-	// Prepare queries
-	delBookmark := `DELETE FROM bookmark`
-	delBookmarkTag := `DELETE FROM bookmark_tag`
-
-	// Delete bookmark(s)
-	if len(ids) == 0 {
-		tx.MustExec(delBookmarkTag)
-		tx.MustExec(delBookmark)
-	} else {
-		delBookmark += ` WHERE id = $1`
-		delBookmarkTag += ` WHERE bookmark_id = $1`
-
-		stmtDelBookmark, _ := tx.Preparex(delBookmark)
-		stmtDelBookmarkTag, _ := tx.Preparex(delBookmarkTag)
-
-		for _, id := range ids {
-			stmtDelBookmarkTag.MustExec(id)
-			stmtDelBookmark.MustExec(id)
-		}
-	}
-
-	// Commit transaction
-	err = tx.Commit()
-	checkError(err)
-
-	return err
+	return nil
 }
 
-// GetBookmark fetchs bookmark based on its ID or URL.
+// GetBookmark fetches bookmark based on its ID or URL.
 // Returns the bookmark and boolean whether it's exist or not.
-func (db *PGDatabase) GetBookmark(id int, url string) (model.Bookmark, bool) {
+func (db *PGDatabase) GetBookmark(ctx context.Context, id int, url string) (model.BookmarkDTO, bool, error) {
 	args := []interface{}{id}
 	query := `SELECT
-		id, url, title, excerpt, author, public, 
-		content, html, modified, content <> '' has_content
+		id, url, title, excerpt, author, public,
+		content, html, modified_at, created_at, content <> '' has_content
 		FROM bookmark WHERE id = $1`
 
 	if url != "" {
@@ -508,14 +581,16 @@ func (db *PGDatabase) GetBookmark(id int, url string) (model.Bookmark, bool) {
 		args = append(args, url)
 	}
 
-	book := model.Bookmark{}
-	db.Get(&book, query, args...)
+	book := model.BookmarkDTO{}
+	if err := db.GetContext(ctx, &book, query, args...); err != nil && err != sql.ErrNoRows {
+		return book, false, errors.WithStack(err)
+	}
 
-	return book, book.ID != 0
+	return book, book.ID != 0, nil
 }
 
 // SaveAccount saves new account to database. Returns error if any happened.
-func (db *PGDatabase) SaveAccount(account model.Account) (err error) {
+func (db *PGDatabase) SaveAccount(ctx context.Context, account model.Account) (err error) {
 	// Hash password with bcrypt
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(account.Password), 10)
 	if err != nil {
@@ -523,21 +598,33 @@ func (db *PGDatabase) SaveAccount(account model.Account) (err error) {
 	}
 
 	// Insert account to database
-	_, err = db.Exec(`INSERT INTO account
-		(username, password, owner) VALUES ($1, $2, $3)
+	_, err = db.ExecContext(ctx, `INSERT INTO account
+		(username, password, owner, config) VALUES ($1, $2, $3, $4)
 		ON CONFLICT(username) DO UPDATE SET
 		password = $2,
 		owner = $3`,
-		account.Username, hashedPassword, account.Owner)
+		account.Username, hashedPassword, account.Owner, account.Config)
 
-	return err
+	return errors.WithStack(err)
+}
+
+// SaveAccountSettings update settings for specific account  in database. Returns error if any happened
+func (db *PGDatabase) SaveAccountSettings(ctx context.Context, account model.Account) (err error) {
+
+	// Insert account to database
+	_, err = db.ExecContext(ctx, `UPDATE account
+   		SET config = $1
+   		WHERE username = $2`,
+		account.Config, account.Username)
+
+	return errors.WithStack(err)
 }
 
 // GetAccounts fetch list of account (without its password) based on submitted options.
-func (db *PGDatabase) GetAccounts(opts GetAccountsOptions) ([]model.Account, error) {
+func (db *PGDatabase) GetAccounts(ctx context.Context, opts GetAccountsOptions) ([]model.Account, error) {
 	// Create query
 	args := []interface{}{}
-	query := `SELECT id, username, owner FROM account WHERE TRUE`
+	query := `SELECT id, username, owner, config FROM account WHERE TRUE`
 
 	if opts.Keyword != "" {
 		query += " AND username LIKE $1"
@@ -552,9 +639,9 @@ func (db *PGDatabase) GetAccounts(opts GetAccountsOptions) ([]model.Account, err
 
 	// Fetch list account
 	accounts := []model.Account{}
-	err := db.Select(&accounts, query, args...)
+	err := db.SelectContext(ctx, &accounts, query, args...)
 	if err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("failed to fetch accounts: %v", err)
+		return nil, errors.WithStack(err)
 	}
 
 	return accounts, nil
@@ -562,77 +649,78 @@ func (db *PGDatabase) GetAccounts(opts GetAccountsOptions) ([]model.Account, err
 
 // GetAccount fetch account with matching username.
 // Returns the account and boolean whether it's exist or not.
-func (db *PGDatabase) GetAccount(username string) (model.Account, bool) {
+func (db *PGDatabase) GetAccount(ctx context.Context, username string) (model.Account, bool, error) {
 	account := model.Account{}
-	db.Get(&account, `SELECT 
-		id, username, password, owner FROM account WHERE username = $1`,
-		username)
+	if err := db.GetContext(ctx, &account, `SELECT
+		id, username, password, owner, config FROM account WHERE username = $1`,
+		username,
+	); err != nil {
+		return account, false, errors.WithStack(err)
+	}
 
-	return account, account.ID != 0
+	return account, account.ID != 0, nil
 }
 
 // DeleteAccounts removes all record with matching usernames.
-func (db *PGDatabase) DeleteAccounts(usernames ...string) (err error) {
-	// Begin transaction
-	tx, err := db.Beginx()
-	if err != nil {
-		return err
-	}
-
-	// Make sure to rollback if panic ever happened
-	defer func() {
-		if r := recover(); r != nil {
-			panicErr, _ := r.(error)
-			tx.Rollback()
-
-			err = panicErr
+func (db *PGDatabase) DeleteAccounts(ctx context.Context, usernames ...string) (err error) {
+	if err := db.withTx(ctx, func(tx *sqlx.Tx) error {
+		// Delete account
+		stmtDelete, _ := tx.Preparex(`DELETE FROM account WHERE username = $1`)
+		for _, username := range usernames {
+			if _, err := stmtDelete.ExecContext(ctx, username); err != nil {
+				return errors.WithStack(err)
+			}
 		}
-	}()
 
-	// Delete account
-	stmtDelete, _ := tx.Preparex(`DELETE FROM account WHERE username = $1`)
-	for _, username := range usernames {
-		stmtDelete.MustExec(username)
+		return nil
+	}); err != nil {
+		return errors.WithStack(err)
 	}
 
-	// Commit transaction
-	err = tx.Commit()
-	checkError(err)
+	return nil
+}
 
-	return err
+// CreateTags creates new tags from submitted objects.
+func (db *PGDatabase) CreateTags(ctx context.Context, tags ...model.Tag) error {
+	query := `INSERT INTO tag (name) VALUES (:name)`
+
+	if err := db.withTx(ctx, func(tx *sqlx.Tx) error {
+		if _, err := tx.NamedExec(query, tags); err != nil {
+			return errors.WithStack(err)
+		}
+
+		return nil
+	}); err != nil {
+		return errors.Wrap(errors.WithStack(err), "error running transaction")
+	}
+
+	return nil
 }
 
 // GetTags fetch list of tags and their frequency.
-func (db *PGDatabase) GetTags() ([]model.Tag, error) {
+func (db *PGDatabase) GetTags(ctx context.Context) ([]model.Tag, error) {
 	tags := []model.Tag{}
-	query := `SELECT bt.tag_id id, t.name, COUNT(bt.tag_id) n_bookmarks 
-		FROM bookmark_tag bt 
+	query := `SELECT bt.tag_id id, t.name, COUNT(bt.tag_id) n_bookmarks
+		FROM bookmark_tag bt
 		LEFT JOIN tag t ON bt.tag_id = t.id
 		GROUP BY bt.tag_id, t.name ORDER BY t.name`
 
-	err := db.Select(&tags, query)
+	err := db.SelectContext(ctx, &tags, query)
 	if err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("failed to fetch tags: %v", err)
+		return nil, errors.WithStack(err)
 	}
 
 	return tags, nil
 }
 
 // RenameTag change the name of a tag.
-func (db *PGDatabase) RenameTag(id int, newName string) error {
-	_, err := db.Exec(`UPDATE tag SET name = $1 WHERE id = $2`, newName, id)
-	return err
-}
-
-// CreateNewID creates new ID for specified table
-func (db *PGDatabase) CreateNewID(table string) (int, error) {
-	var tableID int
-	query := fmt.Sprintf(`SELECT last_value from %s_id_seq;`, table)
-
-	err := db.Get(&tableID, query)
-	if err != nil && err != sql.ErrNoRows {
-		return -1, err
+func (db *PGDatabase) RenameTag(ctx context.Context, id int, newName string) error {
+	if err := db.withTx(ctx, func(tx *sqlx.Tx) error {
+		_, err := db.Exec(`UPDATE tag SET name = $1 WHERE id = $2`, newName, id)
+		return errors.WithStack(err)
+	}); err != nil {
+		return errors.WithStack(err)
 	}
 
-	return tableID, nil
+	return nil
 }
