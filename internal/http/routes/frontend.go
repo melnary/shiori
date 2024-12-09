@@ -54,7 +54,17 @@ func (r *FrontendRoutes) Setup(e *gin.Engine) {
 			"Version":  model.BuildVersion,
 		})
 	})
+	e.Use(serviceWorkerMiddleware(r.cfg))
 	e.StaticFS("/assets", newAssetsFS(r.logger, views.Assets))
+}
+
+func serviceWorkerMiddleware(cfg *config.Config) gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		if ctx.Request.URL.Path == "/assets/js/pwabuilder-sw.js" {
+			ctx.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+			ctx.Header("Service-Worker-Allowed", cfg.Http.RootPath)
+		}
+	}
 }
 
 func NewFrontendRoutes(logger *logrus.Logger, cfg *config.Config) *FrontendRoutes {

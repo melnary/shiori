@@ -98,7 +98,7 @@
 	<script type="module">
 		if ('serviceWorker' in navigator) {
 			window.addEventListener('load', function() {
-				navigator.serviceWorker.register('assets/js/pwabuilder-sw.js');
+				navigator.serviceWorker.register('assets/js/pwabuilder-sw.js', {scope: '/'});
 			});
 		}
 	</script>
