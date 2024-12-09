@@ -60,7 +60,7 @@ func (r *FrontendRoutes) Setup(e *gin.Engine) {
 
 func serviceWorkerMiddleware(cfg *config.Config) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
-		if ctx.Request.URL.Path == "/assets/js/pwabuilder-sw.js" {
+		if ctx.Request.URL.Path == "/assets/js/sw.js" {
 			ctx.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 			ctx.Header("Service-Worker-Allowed", cfg.Http.RootPath)
 		}
