@@ -1,4 +1,8 @@
-importScripts('https://storage.googleapis.com/workbox-cdn/releases/5.1.2/workbox-sw.js');
+importScripts(
+  "https://storage.googleapis.com/workbox-cdn/releases/6.4.1/workbox-sw.js"
+);
+
+const { Strategy: WorkboxStrategy } = workbox.strategies;
 
 const CACHE = {
   API: "shiori-api-v1",
@@ -30,7 +34,7 @@ self.addEventListener("message", (event) => {
 });
 
 // Connect network route to specific cache
-function registerRoute(matcher, strategy, cacheName, maxEntries, maxAge) {
+function registerCacheRoute(matcher, strategy, cacheName, maxEntries, maxAge) {
   workbox.routing.registerRoute(
     matcher,
     new strategy({
@@ -47,8 +51,8 @@ function registerRoute(matcher, strategy, cacheName, maxEntries, maxAge) {
 
 // Connect asset route to cache with default settings:
 // 15 max entries, 7 days max age, stale-while-revalidate strategy
-function registerDefaultAssetRoute(assetType, cacheName) {
-  registerRoute(
+function registerDefaultAssetCacheRoute(assetType, cacheName) {
+  registerCacheRoute(
     ({request}) => request.destination === assetType,
     STRATEGY.SWR,
     cacheName,
@@ -60,7 +64,7 @@ function registerDefaultAssetRoute(assetType, cacheName) {
 // Total bookmark list is updated frequently, we use a network-first strategy
 // to ensure the list will update as soon as possible.
 // The list is cached for 1 week, for longer offline access.
-registerRoute(
+registerCacheRoute(
   ({url}) => ['/api/bookmarks', '/api/tags', '/api/accounts'].includes(url.pathname),
   STRATEGY.NETWORK_1ST,
   CACHE.API,
@@ -70,8 +74,8 @@ registerRoute(
 
 // API v1 is used for account and bookmark information, we use a network-first
 // strategy to keep the information up-to-date. The API is cached for 1 week.
-registerRoute(
-  ({url}) => url.pathname.startsWith('/api/v1/'),
+registerCacheRoute(
+  ({url}) => url.pathname.startsWith('/api/v1/') && !url.pathname.startsWith('/api/v1/pwa'),
   STRATEGY.NETWORK_1ST,
   CACHE.API,
   100,
@@ -80,7 +84,7 @@ registerRoute(
 
 // Bookmark content pages are not frequently updated, we use a stale-while-revalidate
 // strategy to ensure the content is always available, but also updated when possible.
-registerRoute(
+registerCacheRoute(
   ({url, request}) => request.destination === 'document' && url.pathname.startsWith('/bookmark'),
   STRATEGY.SWR,
   CACHE.BOOKMARK,
@@ -91,7 +95,7 @@ registerRoute(
 // Other pages are frequently updated, we use a network-first strategy to ensure
 // the latest content is always available. However, the pages are cached for 1 week
 // for longer offline access.
-registerRoute(
+registerCacheRoute(
   ({url, request}) => request.destination === 'document' && !url.pathname.startsWith('/bookmark'),
   STRATEGY.NETWORK_1ST,
   CACHE.HTML,
@@ -99,9 +103,49 @@ registerRoute(
   ONE_WEEK
 )
 
+class PWAStrategy extends WorkboxStrategy {
+  async _handle(request, handler) {
+    let success = false;
+
+    try {
+      const response = await handler.fetch(request);
+      if (!response.ok) {
+        throw new Error("pwa request failed with status " + response.status);
+      }
+
+      const result = await response.json();
+      if (!result.ok) {
+        throw new Error("pwa request failed with status " + result.status);
+      }
+    
+      success = true;
+    } catch (error) {
+      console.error(error);
+    }
+
+    const resultString = success ? "ok" : "fail";
+
+    const requestUrl = new URL(request.url);
+    const redirectUrl = new URL(requestUrl.origin);
+    redirectUrl.hash = "home";
+    redirectUrl.searchParams.set("share", resultString);
+
+    const redirectResponse = Response.redirect(redirectUrl, 303);
+  
+    return redirectResponse;
+  }
+}
+
+// PWA POST requests are intercepted by us.
+workbox.routing.registerRoute(
+  ({url}) => url.pathname.startsWith("/api/v1/pwa"),
+  new PWAStrategy({}),
+  "POST"
+);
+
 // Other asset types are cached with default settings.
-registerDefaultAssetRoute("script", CACHE.JS);
-registerDefaultAssetRoute("style", CACHE.STYLE);
-registerDefaultAssetRoute("image", CACHE.IMAGE);
-registerDefaultAssetRoute("font", CACHE.FONT);
-registerDefaultAssetRoute("manifest", CACHE.RESOURCE);
+registerDefaultAssetCacheRoute("script", CACHE.JS);
+registerDefaultAssetCacheRoute("style", CACHE.STYLE);
+registerDefaultAssetCacheRoute("image", CACHE.IMAGE);
+registerDefaultAssetCacheRoute("font", CACHE.FONT);
+registerDefaultAssetCacheRoute("manifest", CACHE.RESOURCE);
