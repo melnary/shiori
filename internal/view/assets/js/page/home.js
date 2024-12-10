@@ -286,6 +286,18 @@ export default {
 					}
 				});
 		},
+		checkBookmarkPWAShareStatus(shareStatus) {
+			if (shareStatus === "ok") {
+				this.showDialogPWAShareTargetResult(true);
+			} else if (shareStatus === "fail") {
+				this.showDialogPWAShareTargetResult(false);
+			}
+
+			// Remove share query from URL
+			const currentUrl = new URL(window.location.href);
+			currentUrl.searchParams.delete("share");
+			window.history.replaceState(history.state, "", currentUrl);
+		},
 		searchBookmarks() {
 			this.page = 1;
 			this.loadData();
@@ -1005,6 +1017,18 @@ export default {
 				},
 			});
 		},
+		showDialogPWAShareTargetResult(success) {
+			this.showDialog({
+				title: "Add Bookmark",
+				content: success
+					? "Successfully added the bookmark!"
+					: "Couldn't share the bookmark... :( Are you logged in?",
+				mainText: "OK",
+				mainClick: () => {
+					this.dialog.visible = false;
+				},
+			});
+		},
 	},
 	mounted() {
 		this.$bus.$on("clearHomePage", () => {
@@ -1034,6 +1058,7 @@ export default {
 		this.search = url.query.search || "";
 		this.page = url.query.page || 1;
 
+		this.checkBookmarkPWAShareStatus(url.query.share);
 		this.loadData(false, true);
 	},
 };
