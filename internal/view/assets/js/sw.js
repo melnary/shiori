@@ -1,6 +1,11 @@
-importScripts(
-  "https://storage.googleapis.com/workbox-cdn/releases/6.4.1/workbox-sw.js"
-);
+importScripts("/assets/js/workbox/workbox-sw.js");
+
+workbox.setConfig({
+  modulePathPrefix: "/assets/js/workbox/"
+  // Workbox runs in production mode by default
+  // on sites other than localhost.
+  // debug: true
+});
 
 const { Strategy: WorkboxStrategy } = workbox.strategies;
 
